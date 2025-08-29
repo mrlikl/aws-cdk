@@ -358,6 +358,25 @@ imported, the producing stack cannot update the value.
 See the [adr](https://github.com/aws/aws-cdk/blob/main/packages/aws-cdk-lib/core/adr/cross-region-stack-references.md)
 for more details on this feature.
 
+### Consumer-driven cross-stack references
+
+By default, cross-stack references use CloudFormation exports/imports. You can configure consumers to use SSM parameters instead for looser coupling:
+
+```ts
+import { StackReferences, ReferenceType } from 'aws-cdk-lib';
+
+// Consumer declares preference for SSM parameters
+StackReferences.of(consumerStack).imports(ReferenceType.SSM);
+
+// Producer automatically creates SSM parameters when referenced
+const bucket = new s3.Bucket(producerStack, 'SharedBucket');
+new s3.Bucket(consumerStack, 'ConsumerBucket', {
+  bucketName: bucket.bucketName, // Creates SSM parameter in producer
+});
+```
+
+The producer creates the optimal export type based on all consumer preferences. Note: This only applies to top-level stacks - nested stacks continue using parameters as before.
+
 ### Removing automatic cross-stack references
 
 The automatic references created by CDK when you use resources across stacks

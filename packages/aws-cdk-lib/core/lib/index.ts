@@ -24,6 +24,7 @@ export * from './cfn-resource';
 export * from './cfn-resource-policy';
 export * from './cfn-rule';
 export * from './stack';
+export * from './stack-references';
 export * from './stage';
 export * from './cfn-element';
 export * from './cfn-dynamic-reference';

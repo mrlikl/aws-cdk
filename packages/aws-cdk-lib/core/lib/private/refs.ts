@@ -20,10 +20,65 @@ import { Names } from '../names';
 import { Reference } from '../reference';
 import { IResolvable } from '../resolvable';
 import { Stack } from '../stack';
+import { ReferenceType } from '../stack-references';
 import { Token, Tokenization } from '../token';
 import { ResolutionTypeHint } from '../type-hints';
 
 export const STRING_LIST_REFERENCE_DELIMITER = '||';
+
+/**
+ * Ensures both CFN export and SSM parameter exist for a reference
+ */
+function ensureBothExportsExist(producer: Stack, reference: Reference): void {
+  const exportable = getExportable(producer, reference);
+  const resolved = producer.resolve(exportable);
+  const id = 'Output' + JSON.stringify(resolved);
+
+  const exportsScope = getCreateExportsScopeForSoftDependency(producer);
+
+  // Generate CloudFormation-compatible export name using the same logic as Stack.exportValue
+  const cfnExportName = generateCfnExportName(exportsScope, id);
+
+  // Generate SSM-compatible export name (with "/" allowed)
+  const ssmExportName = generateExportNameForSoftDependency(exportsScope, id);
+
+  // Ensure CFN export exists
+  const output = exportsScope.node.tryFindChild(id) as CfnOutput;
+  if (!output) {
+    new CfnOutput(exportsScope, id, {
+      value: Token.asString(exportable),
+      exportName: cfnExportName,
+    });
+  }
+
+  // Also create SSM parameter using consistent ID pattern
+  const ssmId = 'SsmParam' + id;
+  createSSMParameterInProducer(exportsScope, ssmId, ssmExportName, exportable);
+}
+
+/**
+ * Generate CloudFormation export name using the same logic as Stack.exportValue
+ */
+function generateCfnExportName(stackExports: Construct, id: string): string {
+  const stack = Stack.of(stackExports);
+  const components = [
+    ...stackExports.node.scopes
+      .slice(2) // Same as CloudFormation exports
+      .map(c => c.node.id),
+    id,
+  ];
+  const prefix = stack.stackName ? stack.stackName + ':' : '';
+  const localPart = makeUniqueId(components);
+  const maxLength = 255;
+  return prefix + localPart.slice(Math.max(0, localPart.length - maxLength + prefix.length));
+}
+
+/**
+ * Get the reference type for exports from the construct context
+ */
+function getExportReferenceType(scope: IConstruct): ReferenceType {
+  return scope.node.tryGetContext('aws-cdk:stack-references:exports') ?? ReferenceType.CFN;
+}
 
 /**
  * This is called from the App level to resolve all references defined. Each
@@ -32,21 +87,76 @@ export const STRING_LIST_REFERENCE_DELIMITER = '||';
 export function resolveReferences(scope: IConstruct): void {
   const edges = findAllReferences(scope);
 
+  // Group references by producer + exportable value
+  const referenceGroups = new Map<string, {
+    reference: Reference;
+    consumers: { stack: Stack; preference: ReferenceType }[];
+  }>();
+
+  // Collect all consumer preferences for each reference
   for (const { source, value } of edges) {
     const consumer = Stack.of(source);
+    const producer = Stack.of(value.target);
+    const exportable = getExportable(producer, value);
+    const resolved = producer.resolve(exportable);
+    const key = `${producer.node.path}:${JSON.stringify(resolved)}`;
 
-    // resolve the value in the context of the consumer
+    if (!referenceGroups.has(key)) {
+      referenceGroups.set(key, { reference: value, consumers: [] });
+    }
+
+    const preference = getExportReferenceType(consumer);
+    referenceGroups.get(key)!.consumers.push({ stack: consumer, preference });
+  }
+
+  // Create exports based on aggregated preferences and mark as handled
+  const handledReferences = new Set<Reference>();
+  for (const [, group] of referenceGroups) {
+    const preferences = group.consumers.map(c => c.preference);
+    const needsCFN = preferences.includes(ReferenceType.CFN) || preferences.includes(ReferenceType.CFN_AND_SSM);
+    const needsSSM = preferences.includes(ReferenceType.SSM) || preferences.includes(ReferenceType.CFN_AND_SSM);
+
+    const producer = Stack.of(group.reference.target);
+
+    if (needsCFN && needsSSM) {
+      ensureBothExportsExist(producer, group.reference);
+    } else if (needsSSM) {
+      ensureSSMExportExists(producer, group.reference);
+    }
+    // CFN-only is handled by default createImportValue
+
+    handledReferences.add(group.reference);
+  }
+
+  // Now resolve each consumer's import
+  for (const { source, value } of edges) {
+    const consumer = Stack.of(source);
     if (!value.hasValueForStack(consumer)) {
-      const resolved = resolveValue(consumer, value);
+      const resolved = resolveValueForConsumer(consumer, value);
       value.assignValueForStack(consumer, resolved);
     }
   }
 }
 
 /**
+ * Ensures only SSM parameter exists for a reference
+ */
+function ensureSSMExportExists(producer: Stack, reference: Reference): void {
+  const exportable = getExportable(producer, reference);
+  const resolved = producer.resolve(exportable);
+  const id = 'Output' + JSON.stringify(resolved);
+
+  const exportsScope = getCreateExportsScopeForSoftDependency(producer);
+  const ssmExportName = generateExportNameForSoftDependency(exportsScope, id);
+
+  // Create SSM parameter using same ID as individual resolution to avoid duplicates
+  createSSMParameterInProducer(exportsScope, id, ssmExportName, exportable);
+}
+
+/**
  * Resolves the value for `reference` in the context of `consumer`.
  */
-function resolveValue(consumer: Stack, reference: CfnReference): IResolvable {
+function resolveValueForConsumer(consumer: Stack, reference: CfnReference): IResolvable {
   const producer = Stack.of(reference.target);
   const producerAccount = !Token.isUnresolved(producer.account) ? producer.account : cxapi.UNKNOWN_ACCOUNT;
   const producerRegion = !Token.isUnresolved(producer.region) ? producer.region : cxapi.UNKNOWN_REGION;
@@ -86,7 +196,7 @@ function resolveValue(consumer: Stack, reference: CfnReference): IResolvable {
   // wire through a CloudFormation parameter and then resolve the reference with
   // the parent stack as the consumer.
   if (consumer.nestedStackParent && isNested(consumer, producer)) {
-    const parameterValue = resolveValue(consumer.nestedStackParent, reference);
+    const parameterValue = resolveValueForConsumer(consumer.nestedStackParent, reference);
     return createNestedStackParameter(consumer, reference, parameterValue);
   }
 
@@ -106,7 +216,7 @@ function resolveValue(consumer: Stack, reference: CfnReference): IResolvable {
   // therefore, we can only export from a top-level stack.
   if (producer.nested) {
     const outputValue = createNestedStackOutput(producer, reference);
-    const resolvedValue = resolveValue(consumer, outputValue);
+    const resolvedValue = resolveValueForConsumer(consumer, outputValue);
 
     if (reference.typeHint === ResolutionTypeHint.STRING_LIST) {
       return Tokenization.reverseList(Fn.split(STRING_LIST_REFERENCE_DELIMITER, Token.asString(resolvedValue))) as IResolvable;
@@ -140,11 +250,16 @@ function resolveValue(consumer: Stack, reference: CfnReference): IResolvable {
   consumer.addDependency(producer,
     `${consumer.node.path} -> ${reference.target.node.path}.${reference.displayName}`);
 
-  // Check if consumer wants soft dependency (SSM parameters)
-  if (consumer._softDependency) {
+  // Producer exports are already created in aggregation phase
+  // Now just create the appropriate consumer import based on preference
+  const consumerExportPreference = getExportReferenceType(consumer);
+
+  if (consumerExportPreference === ReferenceType.SSM) {
+    // Consumer wants SSM import
     return createSoftDependencyImportValue(reference, consumer);
   }
 
+  // Default: CFN import (works for CFN, CFN_AND_SSM)
   return createImportValue(reference);
 }
 
